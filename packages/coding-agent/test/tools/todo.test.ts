@@ -5,6 +5,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
+	applyOpsToPhases,
 	markdownToPhases,
 	nextActionableTask,
 	phasesToMarkdown,
@@ -440,6 +441,165 @@ describe("TodoTool operations", () => {
 		if (summary?.type !== "text") throw new Error("Expected text summary");
 		expect(summary.text).toContain("Todo list is empty.");
 		expect(result.isError).toBeUndefined();
+	});
+});
+
+describe("TodoTool done/drop scope", () => {
+	// The 2026-10-06 session: nine Phase 2 items, then one `done` naming four in
+	// `items`. omp ignored `items` and, with no task or phase, closed all nine.
+	const SESSION_ITEMS = [
+		"P1-9 security static whitelist",
+		"P0-7 reconnect backoff + banner",
+		"P0-6 solo mill Echo-lever path + smoke Chapter II solo",
+		"P1-3 paged NPC dialogue box (A page, B close, ≥16px phone, movement lock)",
+		"P1-4 HUD panels no overlap at 430px/573px stages, log box keeps last lines fading old",
+		"P1-6 ghost couriers only connected drawn; offline stay in save not world",
+		"P1-12 town heal restores HP AND PP; blackout restore also PP",
+		"P1-11 first wild encounters winnable with starter",
+		"P1-7+P1-8 server computes catch odds/lantern counts; per-player token identity",
+	];
+
+	async function sessionTool(): Promise<TodoTool> {
+		const tool = new TodoTool(createSession());
+		await tool.execute("init", {
+			op: "init",
+			i: "Phase 2 backlog tracking",
+			list: [{ phase: "Phase 2", items: SESSION_ITEMS }],
+		} as never);
+		return tool;
+	}
+
+	function statuses(result: { details?: { phases: TodoPhase[] } }): string[] {
+		return (result.details?.phases ?? []).flatMap(phase => phase.tasks.map(task => task.status));
+	}
+
+	function text(result: { content: { type: string; text?: string }[] }): string {
+		const part = result.content.find(item => item.type === "text");
+		return part?.text ?? "";
+	}
+
+	it("marks exactly the tasks named in items (session repro)", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("done", {
+			op: "done",
+			i: "Mark items one through four",
+			items: SESSION_ITEMS.slice(0, 4),
+		} as never);
+
+		expect(result.isError).toBeUndefined();
+		expect(statuses(result)).toEqual([
+			"completed",
+			"completed",
+			"completed",
+			"completed",
+			"in_progress",
+			"pending",
+			"pending",
+			"pending",
+			"pending",
+		]);
+		expect(result.details?.completedTasks?.map(task => task.content)).toEqual(SESSION_ITEMS.slice(0, 4));
+	});
+
+	it("marks exactly the tasks named in a list entry's items", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("done", {
+			op: "done",
+			list: [{ phase: "Phase 2", items: [SESSION_ITEMS[1], SESSION_ITEMS[6]] }],
+		});
+
+		expect(result.isError).toBeUndefined();
+		const done = result.details?.phases[0]?.tasks.filter(task => task.status === "completed").map(t => t.content);
+		expect(done).toEqual([SESSION_ITEMS[1], SESSION_ITEMS[6]]);
+	});
+
+	it("drops exactly the tasks named in items", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("drop", { op: "drop", items: [SESSION_ITEMS[2], SESSION_ITEMS[3]] });
+
+		expect(result.isError).toBeUndefined();
+		expect(statuses(result).filter(status => status === "abandoned")).toHaveLength(2);
+		expect(statuses(result).filter(status => status === "completed")).toHaveLength(0);
+		expect(result.details?.phases[0]?.tasks[2]?.status).toBe("abandoned");
+		expect(result.details?.phases[0]?.tasks[3]?.status).toBe("abandoned");
+	});
+
+	it("combines task and items", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("done", { op: "done", task: SESSION_ITEMS[0], items: [SESSION_ITEMS[8]] });
+
+		expect(result.isError).toBeUndefined();
+		const done = result.details?.phases[0]?.tasks.filter(task => task.status === "completed").map(t => t.content);
+		expect(done).toEqual([SESSION_ITEMS[0], SESSION_ITEMS[8]]);
+	});
+
+	it("rejects the whole call when one named item is unknown", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("done", { op: "done", items: [SESSION_ITEMS[0], "P9-9 not a task"] });
+
+		expect(result.isError).toBe(true);
+		expect(text(result)).toContain('Task "P9-9 not a task" not found');
+		expect(statuses(result).filter(status => status === "completed")).toHaveLength(0);
+	});
+
+	it("checks named items against a phase given alongside", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("init", {
+			op: "init",
+			list: [
+				{ phase: "A", items: ["a1", "a2"] },
+				{ phase: "B", items: ["b1"] },
+			],
+		});
+
+		const ok = await tool.execute("done", { op: "done", phase: "A", items: ["a2"] });
+		expect(ok.isError).toBeUndefined();
+		expect(statuses(ok)).toEqual(["in_progress", "completed", "pending"]);
+
+		const wrong = await tool.execute("done", { op: "done", phase: "A", items: ["b1"] });
+		expect(wrong.isError).toBe(true);
+		expect(text(wrong)).toContain('Task "b1" is not in phase "A"');
+		expect(statuses(wrong)).toEqual(["in_progress", "completed", "pending"]);
+	});
+
+	for (const op of ["done", "drop"] as const) {
+		it(`refuses a bare ${op}, changes nothing, and names the open tasks`, async () => {
+			const tool = await sessionTool();
+			await tool.execute("first", { op: "done", task: SESSION_ITEMS[0] });
+
+			const result = await tool.execute("bare", { op });
+			expect(result.isError).toBe(true);
+			expect(statuses(result)).toEqual(["completed", "in_progress", ...Array(7).fill("pending")]);
+			const message = text(result);
+			expect(message).toContain(`${op} needs a target and changed nothing`);
+			expect(message).toContain(`"${SESSION_ITEMS[1]}"`);
+			expect(message).toContain(`"${SESSION_ITEMS[8]}"`);
+			// The open-task list leaves out the closed one.
+			expect(message).not.toContain(`Open tasks: "${SESSION_ITEMS[0]}"`);
+		});
+	}
+
+	it("treats an empty items list as no target", async () => {
+		const tool = await sessionTool();
+		const result = await tool.execute("done", { op: "done", items: [] });
+
+		expect(result.isError).toBe(true);
+		expect(statuses(result).filter(status => status === "completed")).toHaveLength(0);
+	});
+
+	it("keeps the /todo slash path's bare done as mark-all", () => {
+		const phases: TodoPhase[] = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "a", status: "in_progress" },
+					{ content: "b", status: "pending" },
+				],
+			},
+		];
+		const { phases: next, errors } = applyOpsToPhases(phases, [{ op: "done" }]);
+		expect(errors).toEqual([]);
+		expect(next[0]?.tasks.map(task => task.status)).toEqual(["completed", "completed"]);
 	});
 });
 

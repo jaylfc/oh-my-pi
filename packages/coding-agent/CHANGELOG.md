@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `todo` tool's `done` and `drop` ignoring `items` and `list`: they now close exactly the named tasks, and a call with no `task`, `phase`, `items` or `list` is refused with the open tasks listed instead of closing every open task. The `/todo done` and `/todo drop` slash commands keep their mark-all behavior.
+
 ## [18.7.0] - 2026-10-06
 
 ### Added

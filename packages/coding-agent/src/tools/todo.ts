@@ -65,7 +65,7 @@ const todoSchema = type({
 	// No `atLeastLength(1)` here: `items` is only meaningful for `init`/`append`,
 	// and both enforce non-empty with op-specific errors. A stray `items: []` on
 	// an op that ignores it (e.g. `view`) must not be a hard schema rejection.
-	"items?": type("string").array().describe("tasks for flat init or append"),
+	"items?": type("string").array().describe("tasks for flat init or append; several tasks for done/drop"),
 	"reason?": type("string").describe("blocker note for block"),
 });
 
@@ -291,7 +291,56 @@ function resolvePhaseOrError(phases: TodoPhase[], name: string | undefined, erro
 	return phase;
 }
 
-function getTaskTargets(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string[]): TodoItem[] {
+/**
+ * What an op with no `task`, `phase`, `items` or `list` targets. The `/todo`
+ * slash command means "all" by a bare `/todo done`; the model-facing tool
+ * refuses instead, because a bare model call usually lost its target (e.g. it
+ * sent `items` before they were honored) and closing every open task is not
+ * recoverable from the model's side.
+ */
+type UntargetedPolicy = "all" | "refuse";
+
+interface ApplyOptions {
+	untargeted: UntargetedPolicy;
+}
+
+/** Task contents named in `items` and in the inner `items` of each `list` entry, deduped, in order. */
+function namedTaskContents(entry: TodoOpEntryValue): string[] {
+	const names = [...(entry.items ?? []), ...(entry.list ?? []).flatMap(listEntry => listEntry.items)];
+	return [...new Set(names)];
+}
+
+function openTaskContents(phases: TodoPhase[]): string[] {
+	return phases
+		.flatMap(phase => phase.tasks)
+		.filter(task => task.status !== "completed" && task.status !== "abandoned")
+		.map(task => task.content);
+}
+
+function getTaskTargets(
+	phases: TodoPhase[],
+	entry: TodoOpEntryValue,
+	errors: string[],
+	options: ApplyOptions = { untargeted: "all" },
+): TodoItem[] {
+	const named = namedTaskContents(entry);
+	if (named.length > 0) {
+		// Several tasks at once: exactly the named ones, plus `task` if also given.
+		// A `phase` alongside narrows the lookup: each name must be in that phase.
+		const scope = entry.phase ? resolvePhaseOrError(phases, entry.phase, errors) : undefined;
+		if (entry.phase && !scope) return [];
+		const targets: TodoItem[] = [];
+		for (const content of entry.task && !named.includes(entry.task) ? [entry.task, ...named] : named) {
+			const hit = resolveTaskOrError(phases, content, errors);
+			if (!hit) continue;
+			if (scope && hit.phase !== scope) {
+				errors.push(`Task "${content}" is not in phase "${scope.name}"`);
+				continue;
+			}
+			targets.push(hit.task);
+		}
+		return targets;
+	}
 	if (entry.task) {
 		const hit = resolveTaskOrError(phases, entry.task, errors);
 		return hit ? [hit.task] : [];
@@ -299,6 +348,14 @@ function getTaskTargets(phases: TodoPhase[], entry: TodoOpEntryValue, errors: st
 	if (entry.phase) {
 		const phase = resolvePhaseOrError(phases, entry.phase, errors);
 		return phase ? [...phase.tasks] : [];
+	}
+	if (options.untargeted === "refuse") {
+		const open = openTaskContents(phases);
+		const listed = open.length > 0 ? ` Open tasks: ${open.map(content => `"${content}"`).join(", ")}.` : "";
+		errors.push(
+			`${entry.op} needs a target and changed nothing: pass "task" (one task), "items" (several tasks) or "phase" (a whole phase), using the tasks' exact text.${listed}`,
+		);
+		return [];
 	}
 	return phases.flatMap(phase => phase.tasks);
 }
@@ -396,7 +453,12 @@ function removeTasks(phases: TodoPhase[], entry: TodoOpEntryValue, errors: strin
 	return phases;
 }
 
-function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
+function applyEntry(
+	phases: TodoPhase[],
+	entry: TodoOpEntryValue,
+	errors: string[],
+	options: ApplyOptions = { untargeted: "all" },
+): TodoPhase[] {
 	switch (entry.op) {
 		case "init":
 			return initPhases(entry, errors);
@@ -414,13 +476,13 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 			return phases;
 		}
 		case "done": {
-			for (const task of getTaskTargets(phases, entry, errors)) {
+			for (const task of getTaskTargets(phases, entry, errors, options)) {
 				task.status = "completed";
 			}
 			return phases;
 		}
 		case "drop": {
-			for (const task of getTaskTargets(phases, entry, errors)) {
+			for (const task of getTaskTargets(phases, entry, errors, options)) {
 				task.status = "abandoned";
 			}
 			return phases;
@@ -510,7 +572,8 @@ function resolveTodoParams(raw: unknown, hasExistingPhases: boolean): TodoOpEntr
 
 function applyParams(phases: TodoPhase[], params: TodoOpEntryValue): { phases: TodoPhase[]; errors: string[] } {
 	const errors: string[] = [];
-	const next = applyEntry(phases, params, errors);
+	// The model-facing path: a bare done/drop is refused, never "close everything".
+	const next = applyEntry(phases, params, errors, { untargeted: "refuse" });
 	normalizeInProgressTask(next);
 	return { phases: next, errors };
 }
